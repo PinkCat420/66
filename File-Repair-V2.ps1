@@ -1,11 +1,14 @@
 #================================================================================
-#                         Multi-Phase File Repair Script (V2)
+#                  Advanced Multi-Phase File Repair Script (V3)
 #================================================================================
 #
-# V2 Update: Includes a new "Phase 0" to perform a deep validation scan on
-#            images to detect internal data corruption before attempting repairs.
+# V3 Update: Complete logic overhaul for improved accuracy and performance.
+#            - Sanitizes filenames before processing to handle special characters.
+#            - Repairs extensions, fixes common PNG warnings, and tests archives.
+#            - Deletes password-protected archives automatically.
+#            - Performs a final validation scan to only log truly unrecoverable files.
 #
-# DEPENDENCIES: exiftool.exe, 7z.exe (must be in system PATH or script folder)
+# DEPENDENCIES: exiftool.exe, 7z.exe, optipng.exe (must be in system PATH)
 #
 #================================================================================
 
@@ -30,7 +33,7 @@ if ($PSVersionTable.PSVersion.Major -lt 7) {
 }
 
 # --- Initial Setup ---
-Write-Host "--- Multi-Phase File Repair Script V2.1 (Parallel) ---" -ForegroundColor Yellow
+Write-Host "--- Advanced Multi-Phase File Repair Script V3 ---" -ForegroundColor Yellow
 Write-Host "Using a throttle limit of $throttleLimit processes."
 if (Test-Path $repairedLog) { Remove-Item $repairedLog }
 if (Test-Path $unrecoverableLog) { Remove-Item $unrecoverableLog }
@@ -38,7 +41,7 @@ if (Test-Path $unrecoverableLog) { Remove-Item $unrecoverableLog }
 "Unrecoverable file log started at $startTime" | Out-File -FilePath $unrecoverableLog -Encoding utf8
 
 # --- Dependency Check ---
-$dependencies = "exiftool", "7z"
+$dependencies = "exiftool", "7z", "optipng"
 foreach ($dep in $dependencies) {
     if (-not (Get-Command $dep -ErrorAction SilentlyContinue)) {
         Write-Host "FATAL ERROR: Dependency '$dep.exe' not found." -ForegroundColor Red
@@ -51,91 +54,111 @@ Write-Host "Dependencies found. Ready to proceed." -ForegroundColor Green
 Write-Host "WARNING: This script will RENAME files in place. It is highly recommended to run this on a BACKUP of your data." -ForegroundColor Red
 Read-Host "Press Enter to begin the repair process or Ctrl+C to abort..."
 
-# --- Get Initial File List ---
-$allFiles = Get-ChildItem -Path $PSScriptRoot -Recurse -File
+# --- PHASE 1: Sanitize File and Directory Names ---
+Write-Host "`n--- PHASE 1: Sanitizing File and Directory Names ---" -ForegroundColor Cyan
+$sanitizedCount = 0
+# We must get all items first, because renaming can interfere with the Get-ChildItem pipeline.
+# Sanitize directories first, from deepest to shallowest, to avoid breaking paths.
+$allDirs = Get-ChildItem -Path $PSScriptRoot -Recurse -Directory | Sort-Object { $_.FullName.Length } -Descending
+foreach ($dir in $allDirs) {
+    $originalName = $dir.Name
+    # Regex to find any character that is NOT a letter, number, dot, hyphen, or underscore.
+    $sanitizedName = $originalName -replace '[^a-zA-Z0-9._-]', '_'
 
-# --- PHASE 0: Deep Image Corruption Scan ---
-Write-Host "`n--- PHASE 0: Deep Scanning Images for Corruption ---" -ForegroundColor Cyan
-# Use a thread-safe collection for the exclusion list.
-$corruptFilesList = [System.Collections.Concurrent.ConcurrentBag[string]]::new()
-$imagesToScan = $allFiles | Where-Object { $imageExtensions -contains $_.Extension.ToLower() }
-$totalImages = ($imagesToScan | Measure-Object).Count
-$processedImages = 0
-$corruptImageCount = 0
-
-# Process images in parallel.
-$phase0Results = $imagesToScan | ForEach-Object -ThrottleLimit $throttleLimit -Parallel {
-    $image = $_
-    $currentCount = [System.Threading.Interlocked]::Increment([ref]$using:processedImages)
-    Write-Progress -Activity "Phase 0: Deep Scanning Images" -Id 0 -Status "$currentCount / $using:totalImages : $($image.Name)" -PercentComplete (($currentCount / $using:totalImages) * 100)
-
-    # Use exiftool's built-in validation.
-    $validationResult = exiftool -check -fast "$($image.FullName)" 2>&1
-
-    if (-not [string]::IsNullOrWhiteSpace($validationResult)) {
-        # Return a result object for logging later.
-        [pscustomobject]@{
-            Corrupt      = $true
-            FullName     = $image.FullName
-            Validation   = $validationResult
+    if ($originalName -ne $sanitizedName) {
+        $newDirPath = Join-Path -Path $dir.Parent.FullName -ChildPath $sanitizedName
+        if (Test-Path $newDirPath) {
+            $logEntry = "CONFLICT (Dir): Could not rename '$($dir.FullName)' to '$sanitizedName' because a directory with that name already exists."
+            Write-Host $logEntry -ForegroundColor Yellow
+            $logEntry | Out-File -FilePath $unrecoverableLog -Encoding utf8 -Append
+        } else {
+            try {
+                Rename-Item -Path $dir.FullName -NewName $sanitizedName -ErrorAction Stop
+                $logEntry = "SANITIZED (Dir): Renamed '$originalName' -> '$sanitizedName' in '$($dir.Parent.FullName)'"
+                Write-Host $logEntry -ForegroundColor Green
+                $logEntry | Out-File -FilePath $repairedLog -Encoding utf8 -Append
+                $sanitizedCount++
+            } catch {
+                $logEntry = "ERROR (Dir): Failed to rename '$($dir.FullName)'. Details: $($_.Exception.Message)"
+                Write-Host $logEntry -ForegroundColor Red
+                $logEntry | Out-File -FilePath $unrecoverableLog -Encoding utf8 -Append
+            }
         }
-    } else {
-        [pscustomobject]@{ Corrupt = $false }
     }
 }
 
-Write-Progress -Activity "Phase 0: Deep Scanning Images" -Id 0 -Completed
+# Now, sanitize filenames. We re-fetch all files after directory renames have occurred.
+$allFiles = Get-ChildItem -Path $PSScriptRoot -Recurse -File
+foreach ($file in $allFiles) {
+    $originalName = $file.Name
+    $sanitizedName = $originalName -replace '[^a-zA-Z0-9._-]', '_'
 
-# Now, process the results sequentially for safe logging.
-$corruptImages = $phase0Results | Where-Object { $_.Corrupt }
-foreach ($result in $corruptImages) {
-    $corruptImageCount++
-    $logEntry = "CORRUPT IMAGE DETECTED: '$($result.FullName)'"
-    Write-Host $logEntry -ForegroundColor Red
-    $logEntry | Out-File -FilePath $unrecoverableLog -Encoding utf8 -Append
-    $result.Validation | Out-File -FilePath $unrecoverableLog -Encoding utf8 -Append
-    $corruptFilesList.Add($result.FullName)
+    if ($originalName -ne $sanitizedName) {
+        $newFilePath = Join-Path -Path $file.DirectoryName -ChildPath $sanitizedName
+        if (Test-Path $newFilePath) {
+            $logEntry = "CONFLICT (File): Could not rename '$($file.FullName)' to '$sanitizedName' because a file with that name already exists."
+            Write-Host $logEntry -ForegroundColor Yellow
+            $logEntry | Out-File -FilePath $unrecoverableLog -Encoding utf8 -Append
+        } else {
+            try {
+                Rename-Item -Path $file.FullName -NewName $sanitizedName -ErrorAction Stop
+                $logEntry = "SANITIZED (File): Renamed '$($file.FullName)' -> '$newFilePath'"
+                Write-Host $logEntry -ForegroundColor Green
+                $logEntry | Out-File -FilePath $repairedLog -Encoding utf8 -Append
+                $sanitizedCount++
+            } catch {
+                $logEntry = "ERROR (File): Failed to rename '$($file.FullName)'. Details: $($_.Exception.Message)"
+                Write-Host $logEntry -ForegroundColor Red
+                $logEntry | Out-File -FilePath $unrecoverableLog -Encoding utf8 -Append
+            }
+        }
+    }
 }
-Write-Host "Phase 0 Complete. Found $corruptImageCount potentially corrupt images."
+Write-Host "Phase 1 Complete. Sanitized $sanitizedCount file and directory names."
 
-# --- PHASE 1: File Extension Repair ---
-Write-Host "`n--- PHASE 1: Repairing File Extensions ---" -ForegroundColor Cyan
+
+# The file list is now updated after sanitization and available for subsequent phases.
+$allFiles = Get-ChildItem -Path $PSScriptRoot -Recurse -File
+
+# --- PHASE 2: File Extension Repair ---
+Write-Host "`n--- PHASE 2: Repairing File Extensions ---" -ForegroundColor Cyan
 $repairedCount = 0
 
-# Step 1: Identify all potential renames in parallel.
-Write-Host "Phase 1, Step 1: Identifying necessary renames..."
-$processedCount = 0
-$filesToProcess = $allFiles | Where-Object {
-    -not $corruptFilesList.Contains($_.FullName) -and
-    -not ($archiveExtensions -contains $_.Extension.ToLower())
-}
-$totalFiles = ($filesToProcess | Measure-Object).Count
+# Step 1: Get true file types for all files in a single batch operation for performance.
+Write-Host "Phase 2, Step 1: Batch-processing all files to identify necessary renames..."
+$fileDataJson = exiftool -charset filename=UTF8 -json -r -SourceFile -FileTypeExtension "$PSScriptRoot"
+$fileData = $fileDataJson | ConvertFrom-Json
 
-$renamePlan = $filesToProcess | ForEach-Object -ThrottleLimit $throttleLimit -Parallel {
-    $file = $_
-    $currentCount = [System.Threading.Interlocked]::Increment([ref]$using:processedCount)
-    Write-Progress -Activity "Phase 1: Identifying Renames" -Id 1 -Status "$currentCount / $using:totalFiles : $($file.Name)" -PercentComplete (($currentCount / $using:totalFiles) * 100)
+# Step 2: Build the rename plan from the in-memory data. This is much faster than running exiftool per file.
+Write-Host "Phase 2, Step 2: Building rename plan from batch results..."
+$renamePlan = foreach ($file in $fileData) {
+    # It's possible for exiftool to return no FileTypeExtension for some files (e.g. unsupported formats, directories).
+    if (-not $file.PSObject.Properties.Contains('FileTypeExtension')) { continue }
 
-    $trueExtension = (exiftool -s3 -FileTypeExtension $file.FullName).Trim().ToLower()
-    $currentExtension = $file.Extension.TrimStart('.').ToLower()
+    $currentPath = $file.SourceFile
+    $currentExtWithDot = [System.IO.Path]::GetExtension($currentPath).ToLower()
 
-    if (-not [string]::IsNullOrEmpty($trueExtension) -and $trueExtension -ne $currentExtension) {
-        # Improved logic for getting the base name
-        $baseName = [System.IO.Path]::GetFileNameWithoutExtension($file.Name)
-        $newFileName = "$baseName.$trueExtension"
-        $newFilePath = Join-Path -Path $file.DirectoryName -ChildPath $newFileName
+    # Exclude archives from extension repair.
+    if ($archiveExtensions -contains $currentExtWithDot) { continue }
+
+    $currentExt = $currentExtWithDot.TrimStart('.')
+    $trueExt = $file.FileTypeExtension.ToLower()
+
+    if (-not [string]::IsNullOrEmpty($trueExt) -and $trueExt -ne $currentExt) {
+        $baseName = [System.IO.Path]::GetFileNameWithoutExtension($currentPath)
+        $newFileName = "$baseName.$trueExt"
+        $newFilePath = Join-Path -Path ([System.IO.Path]::GetDirectoryName($currentPath)) -ChildPath $newFileName
 
         [pscustomobject]@{
-            OldFullName = $file.FullName
+            OldFullName = $currentPath
             NewFilePath = $newFilePath
             NewFileName = $newFileName
         }
     }
 }
-Write-Progress -Activity "Phase 1: Identifying Renames" -Id 1 -Completed
 
-# Step 2: Resolve conflicts before renaming.
-Write-Host "Phase 1, Step 2: Resolving renaming conflicts..."
+# Step 3: Resolve conflicts before renaming.
+Write-Host "Phase 2, Step 3: Resolving renaming conflicts..."
 $renameGroups = $renamePlan | Where-Object { $_ } | Group-Object NewFilePath
 $goodRenames = [System.Collections.Generic.List[object]]::new()
 
@@ -158,14 +181,14 @@ foreach ($group in $renameGroups) {
 }
 
 # Step 3: Perform the actual renames in parallel.
-Write-Host "Phase 1, Step 3: Performing safe renames..."
+Write-Host "Phase 2, Step 3: Performing safe renames..."
 $totalToRename = $goodRenames.Count
 $processedRenames = 0
 if ($totalToRename -gt 0) {
     $renameResults = $goodRenames | ForEach-Object -ThrottleLimit $throttleLimit -Parallel {
         $rename = $_
         $currentCount = [System.Threading.Interlocked]::Increment([ref]$using:processedRenames)
-        Write-Progress -Activity "Phase 1: Renaming Files" -Id 1 -Status "$currentCount / $using:totalToRename : $($rename.OldFullName)" -PercentComplete (($currentCount / $using:totalToRename) * 100)
+        Write-Progress -Activity "Phase 2: Renaming Files" -Id 1 -Status "$currentCount / $using:totalToRename : $($rename.OldFullName)" -PercentComplete (($currentCount / $using:totalToRename) * 100)
 
         try {
             Rename-Item -Path $rename.OldFullName -NewName $rename.NewFileName -ErrorAction Stop
@@ -174,7 +197,7 @@ if ($totalToRename -gt 0) {
             [pscustomobject]@{ Success = $false; Old = $rename.OldFullName; Error = $_.Exception.Message }
         }
     }
-    Write-Progress -Activity "Phase 1: Renaming Files" -Id 1 -Completed
+    Write-Progress -Activity "Phase 2: Renaming Files" -Id 1 -Completed
 
     # Step 4: Log the results of the rename operations.
     foreach ($result in $renameResults) {
@@ -190,57 +213,150 @@ if ($totalToRename -gt 0) {
         }
     }
 }
-Write-Host "Phase 1 Complete. Repaired $repairedCount file extensions."
+Write-Host "Phase 2 Complete. Repaired $repairedCount file extensions."
 
-# --- PHASE 2: Archive Integrity Testing ---
-Write-Host "`n--- PHASE 2: Testing Archive Integrity ---" -ForegroundColor Cyan
+# --- PHASE 3: PNG Structure Repair ---
+Write-Host "`n--- PHASE 3: Repairing PNG File Structure ---" -ForegroundColor Cyan
+$repairedPngCount = 0
+
+# Use exiftool to find all PNGs that have the specific minor warning we can fix.
+# The warning is "Text/EXIF chunk(s) found after PNG IDAT"
+$pngsToFixPaths = exiftool -charset filename=UTF8 -r -if '($FileType eq "PNG") and ($Warning=~/Text\/EXIF chunk/)' -p '$Directory/$FileName' "$PSScriptRoot"
+# The output can be a single string with newlines, so we split it into an array.
+$pngsToFix = $pngsToFixPaths -split [System.Environment]::NewLine | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+$totalPngsToFix = ($pngsToFix | Measure-Object).Count
+
+if ($totalPngsToFix -gt 0) {
+    Write-Host "Found $totalPngsToFix PNGs with minor structure warnings to repair."
+
+    $processedPngs = 0
+    $pngRepairResults = $pngsToFix | ForEach-Object -ThrottleLimit $throttleLimit -Parallel {
+        $pngPath = $_
+        $currentCount = [System.Threading.Interlocked]::Increment([ref]$using:processedPngs)
+        Write-Progress -Activity "Phase 3: Repairing PNGs" -Id 3 -Status "$currentCount / $using:totalPngsToFix : $pngPath" -PercentComplete (($currentCount / $using:totalPngsToFix) * 100)
+
+        try {
+            # optipng is very quiet on success. -fix will repair the structure.
+            optipng -fix -o2 -quiet "$pngPath"
+            # We assume success if optipng doesn't throw an error.
+            [pscustomobject]@{ Success = $true; Path = $pngPath }
+        } catch {
+            [pscustomobject]@{ Success = $false; Path = $pngPath; Error = $_.Exception.Message }
+        }
+    }
+    Write-Progress -Activity "Phase 3: Repairing PNGs" -Id 3 -Completed
+
+    # Log results sequentially
+    foreach ($result in $pngRepairResults) {
+        if ($result.Success) {
+            $repairedPngCount++
+            $logEntry = "REPAIRED (STRUCTURE): Fixed minor chunk ordering in '$($result.Path)'"
+            Write-Host $logEntry -ForegroundColor Green
+            $logEntry | Out-File -FilePath $repairedLog -Encoding utf8 -Append
+        } else {
+            $logEntry = "ERROR (PNG Repair): optipng failed for '$($result.Path)'. Details: $($result.Error)"
+            Write-Host $logEntry -ForegroundColor Red
+            $logEntry | Out-File -FilePath $unrecoverableLog -Encoding utf8 -Append
+        }
+    }
+}
+Write-Host "Phase 3 Complete. Repaired structure of $repairedPngCount PNG files."
+
+# --- PHASE 4: Archive Integrity Testing & Deletion ---
+Write-Host "`n--- PHASE 4: Testing Archive Integrity & Deleting Passworded Files ---" -ForegroundColor Cyan
 $allArchives = Get-ChildItem -Path $PSScriptRoot -Recurse -File | Where-Object { $archiveExtensions -contains $_.Extension.ToLower() }
 $totalArchives = ($allArchives | Measure-Object).Count
 $processedArchives = 0
 $corruptArchives = 0
+$deletedArchives = 0
 
 # Test archives in parallel.
-$phase2Results = $allArchives | ForEach-Object -ThrottleLimit $throttleLimit -Parallel {
+$phase4Results = $allArchives | ForEach-Object -ThrottleLimit $throttleLimit -Parallel {
     $archive = $_
     $currentCount = [System.Threading.Interlocked]::Increment([ref]$using:processedArchives)
-    Write-Progress -Activity "Phase 2: Testing Archives" -Id 2 -Status "$currentCount / $using:totalArchives : $($archive.Name)" -PercentComplete (($currentCount / $using:totalArchives) * 100)
+    Write-Progress -Activity "Phase 4: Testing Archives" -Id 4 -Status "$currentCount / $using:totalArchives : $($archive.Name)" -PercentComplete (($currentCount / $using:totalArchives) * 100)
 
-    $testResult = 7z t -scsUTF-8 "$($archive.FullName)" 2>&1
+    # We add '-p-' to provide an empty password, preventing 7z from halting the script with a prompt.
+    $testResult = 7z t -scsUTF-8 -p- "$($archive.FullName)" 2>&1
     if ($LASTEXITCODE -ne 0) {
-        [pscustomobject]@{
-            Corrupt     = $true
-            FullName    = $archive.FullName
-            TestResult  = $testResult
+        if ($testResult -match "Wrong password") {
+             [pscustomobject]@{ Status = 'Passworded'; FullName = $archive.FullName; TestResult = $testResult }
+        } else {
+             [pscustomobject]@{ Status = 'Corrupt'; FullName = $archive.FullName; TestResult = $testResult }
         }
     } else {
-        [pscustomobject]@{ Corrupt = $false }
+        [pscustomobject]@{ Status = 'OK' }
     }
 }
-Write-Progress -Activity "Phase 2: Testing Archives" -Id 2 -Completed
+Write-Progress -Activity "Phase 4: Testing Archives" -Id 4 -Completed
 
-# Process results sequentially for safe logging.
-$corruptArchiveResults = $phase2Results | Where-Object { $_.Corrupt }
-foreach ($result in $corruptArchiveResults) {
-    $corruptArchives++
-    $logEntry = "CORRUPT ARCHIVE: '$($result.FullName)' failed integrity test."
-    Write-Host $logEntry -ForegroundColor Red
-    $logEntry | Out-File -FilePath $unrecoverableLog -Encoding utf8 -Append
-    $result.TestResult | Out-File -FilePath $unrecoverableLog -Encoding utf8 -Append
+# Process results sequentially for safe logging and deletion.
+foreach ($result in $phase4Results) {
+    if ($result.Status -eq 'Passworded') {
+        $deletedArchives++
+        $logEntry = "DELETING (Passworded): '$($result.FullName)' appears to be password-protected."
+        Write-Host $logEntry -ForegroundColor Magenta
+        $logEntry | Out-File -FilePath $repairedLog -Encoding utf8 -Append
+        try {
+            Remove-Item -Path $result.FullName -Force -ErrorAction Stop
+            Write-Host "  -> Successfully deleted." -ForegroundColor Magenta
+        } catch {
+            $deleteError = "ERROR (Deletion): Failed to delete '$($result.FullName)'. Details: $($_.Exception.Message)"
+            Write-Host $deleteError -ForegroundColor Red
+            $deleteError | Out-File -FilePath $unrecoverableLog -Encoding utf8 -Append
+        }
+    } elseif ($result.Status -eq 'Corrupt') {
+        $corruptArchives++
+        $logEntry = "CORRUPT ARCHIVE: '$($result.FullName)' failed integrity test."
+        Write-Host $logEntry -ForegroundColor Red
+        $logEntry | Out-File -FilePath $unrecoverableLog -Encoding utf8 -Append
+        $result.TestResult | Out-File -FilePath $unrecoverableLog -Encoding utf8 -Append
+    }
 }
-Write-Host "Phase 2 Complete. Found $corruptArchives potentially corrupt archives."
+Write-Host "Phase 4 Complete. Found $corruptArchives corrupt archives and deleted $deletedArchives password-protected archives."
 
-# --- PHASE 3: Final Reporting ---
-# ... (Phase 3 code is unchanged) ...
-Write-Host "`n--- PHASE 3: Final Report ---" -ForegroundColor Yellow
+# --- PHASE 5: Final Corruption Validation ---
+Write-Host "`n--- PHASE 5: Final Deep Scan for Unrecoverable Images ---" -ForegroundColor Cyan
+$unrecoverableImageCount = 0
+
+# After all repairs, we do a final scan. We now only care about fatal errors, not warnings
+# that we have already attempted to fix. exiftool is run once in batch mode for performance.
+Write-Host "Scanning for images with fatal errors..."
+# Note: The -args parameter is used to pass the list of extensions to the -ext option of exiftool.
+$errorFilesOutput = exiftool -check -fast -r -if '$Error' -p '$Directory/$FileName' -args -ext $imageExtensions "$PSScriptRoot"
+$errorFiles = $errorFilesOutput -split [System.Environment]::NewLine | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+$totalErrorFiles = ($errorFiles | Measure-Object).Count
+
+if ($totalErrorFiles -gt 0) {
+    "--- Final Scan: Unrecoverable Images Detected ---" | Out-File -FilePath $unrecoverableLog -Encoding utf8 -Append
+    foreach ($file in $errorFiles) {
+        $unrecoverableImageCount++
+        $logEntry = "UNRECOVERABLE IMAGE: '$file'"
+        Write-Host $logEntry -ForegroundColor Red
+        $logEntry | Out-File -FilePath $unrecoverableLog -Encoding utf8 -Append
+        # Get the specific error for the log
+        $errorDetails = exiftool -check -fast "$file"
+        $errorDetails | Out-File -FilePath $unrecoverableLog -Encoding utf8 -Append
+    }
+}
+Write-Host "Phase 5 Complete. Found $unrecoverableImageCount images with fatal, unrecoverable errors."
+
+
+# --- PHASE 6: Final Reporting ---
+Write-Host "`n--- PHASE 6: Final Report ---" -ForegroundColor Yellow
 $endTime = Get-Date
 $duration = New-TimeSpan -Start $startTime -End $endTime
 
-Write-Host "Repair process finished in $($duration.TotalSeconds) seconds."
-Write-Host "Identified $corruptImageCount corrupt images in Phase 0." -ForegroundColor Red
-Write-Host "Repaired $repairedCount file extensions in Phase 1." -ForegroundColor Green
-Write-Host "Identified $corruptArchives corrupt archives in Phase 2." -ForegroundColor Red
-Write-Host "Please review the log files for details:"
-Write-Host " - Repaired Actions: $repairedLog"
+Write-Host "`nRepair process finished in $($duration.TotalSeconds) seconds."
+Write-Host "--- Summary ---" -ForegroundColor Yellow
+Write-Host "Phase 1: Sanitized $sanitizedCount file and directory names." -ForegroundColor Green
+Write-Host "Phase 2: Repaired $repairedCount file extensions." -ForegroundColor Green
+Write-Host "Phase 3: Repaired structure of $repairedPngCount PNG files." -ForegroundColor Green
+Write-Host "Phase 4: Deleted $deletedArchives password-protected archives." -ForegroundColor Magenta
+Write-Host "Phase 4: Found $corruptArchives corrupt archives." -ForegroundColor Red
+Write-Host "Phase 5: Found $unrecoverableImageCount images with fatal errors." -ForegroundColor Red
+Write-Host "`nPlease review the log files for details:"
+Write-Host " - Repaired Actions & Deletions: $repairedLog"
 Write-Host " - Unrecoverable/Problematic Files: $unrecoverableLog"
 
 Read-Host "`nProcess complete. Press Enter to exit."
