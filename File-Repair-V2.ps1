@@ -54,6 +54,52 @@ Write-Host "Dependencies found. Ready to proceed." -ForegroundColor Green
 Write-Host "WARNING: This script will RENAME files in place. It is highly recommended to run this on a BACKUP of your data." -ForegroundColor Red
 Read-Host "Press Enter to begin the repair process or Ctrl+C to abort..."
 
+# --- Helper Functions ---
+function Invoke-SanitizeRename {
+    param (
+        [Parameter(Mandatory=$true)]
+        $Item,
+        [Parameter(Mandatory=$true)]
+        [string]$TypeLabel
+    )
+
+    $originalName = $Item.Name
+    # Regex to find any character that is NOT a letter, number, dot, hyphen, or underscore.
+    $sanitizedName = $originalName -replace '[^a-zA-Z0-9._-]', '_'
+
+    if ($originalName -eq $sanitizedName) {
+        return $false
+    }
+
+    $parentPath = $(if ($Item.PSIsContainer) { $Item.Parent.FullName } else { $Item.DirectoryName })
+    $newPath = Join-Path -Path $parentPath -ChildPath $sanitizedName
+    $typeDesc = $(if ($Item.PSIsContainer) { "directory" } else { "file" } )
+
+    if (Test-Path $newPath) {
+        $logEntry = "CONFLICT ($TypeLabel): Could not rename '$($Item.FullName)' to '$sanitizedName' because a $typeDesc with that name already exists."
+        Write-Host $logEntry -ForegroundColor Yellow
+        $logEntry | Out-File -FilePath $unrecoverableLog -Encoding utf8 -Append
+        return $false
+    }
+
+    try {
+        Rename-Item -Path $Item.FullName -NewName $sanitizedName -ErrorAction Stop
+        if ($Item.PSIsContainer) {
+            $logEntry = "SANITIZED ($TypeLabel): Renamed '$originalName' -> '$sanitizedName' in '$parentPath'"
+        } else {
+            $logEntry = "SANITIZED ($TypeLabel): Renamed '$($Item.FullName)' -> '$newPath'"
+        }
+        Write-Host $logEntry -ForegroundColor Green
+        $logEntry | Out-File -FilePath $repairedLog -Encoding utf8 -Append
+        return $true
+    } catch {
+        $logEntry = "ERROR ($TypeLabel): Failed to rename '$($Item.FullName)'. Details: $($_.Exception.Message)"
+        Write-Host $logEntry -ForegroundColor Red
+        $logEntry | Out-File -FilePath $unrecoverableLog -Encoding utf8 -Append
+        return $false
+    }
+}
+
 # --- PHASE 1: Sanitize File and Directory Names ---
 Write-Host "`n--- PHASE 1: Sanitizing File and Directory Names ---" -ForegroundColor Cyan
 $sanitizedCount = 0
@@ -61,57 +107,16 @@ $sanitizedCount = 0
 # Sanitize directories first, from deepest to shallowest, to avoid breaking paths.
 $allDirs = Get-ChildItem -Path $PSScriptRoot -Recurse -Directory | Sort-Object { $_.FullName.Length } -Descending
 foreach ($dir in $allDirs) {
-    $originalName = $dir.Name
-    # Regex to find any character that is NOT a letter, number, dot, hyphen, or underscore.
-    $sanitizedName = $originalName -replace '[^a-zA-Z0-9._-]', '_'
-
-    if ($originalName -ne $sanitizedName) {
-        $newDirPath = Join-Path -Path $dir.Parent.FullName -ChildPath $sanitizedName
-        if (Test-Path $newDirPath) {
-            $logEntry = "CONFLICT (Dir): Could not rename '$($dir.FullName)' to '$sanitizedName' because a directory with that name already exists."
-            Write-Host $logEntry -ForegroundColor Yellow
-            $logEntry | Out-File -FilePath $unrecoverableLog -Encoding utf8 -Append
-        } else {
-            try {
-                Rename-Item -Path $dir.FullName -NewName $sanitizedName -ErrorAction Stop
-                $logEntry = "SANITIZED (Dir): Renamed '$originalName' -> '$sanitizedName' in '$($dir.Parent.FullName)'"
-                Write-Host $logEntry -ForegroundColor Green
-                $logEntry | Out-File -FilePath $repairedLog -Encoding utf8 -Append
-                $sanitizedCount++
-            } catch {
-                $logEntry = "ERROR (Dir): Failed to rename '$($dir.FullName)'. Details: $($_.Exception.Message)"
-                Write-Host $logEntry -ForegroundColor Red
-                $logEntry | Out-File -FilePath $unrecoverableLog -Encoding utf8 -Append
-            }
-        }
+    if (Invoke-SanitizeRename -Item $dir -TypeLabel "Dir") {
+        $sanitizedCount++
     }
 }
 
 # Now, sanitize filenames. We re-fetch all files after directory renames have occurred.
 $allFiles = Get-ChildItem -Path $PSScriptRoot -Recurse -File
 foreach ($file in $allFiles) {
-    $originalName = $file.Name
-    $sanitizedName = $originalName -replace '[^a-zA-Z0-9._-]', '_'
-
-    if ($originalName -ne $sanitizedName) {
-        $newFilePath = Join-Path -Path $file.DirectoryName -ChildPath $sanitizedName
-        if (Test-Path $newFilePath) {
-            $logEntry = "CONFLICT (File): Could not rename '$($file.FullName)' to '$sanitizedName' because a file with that name already exists."
-            Write-Host $logEntry -ForegroundColor Yellow
-            $logEntry | Out-File -FilePath $unrecoverableLog -Encoding utf8 -Append
-        } else {
-            try {
-                Rename-Item -Path $file.FullName -NewName $sanitizedName -ErrorAction Stop
-                $logEntry = "SANITIZED (File): Renamed '$($file.FullName)' -> '$newFilePath'"
-                Write-Host $logEntry -ForegroundColor Green
-                $logEntry | Out-File -FilePath $repairedLog -Encoding utf8 -Append
-                $sanitizedCount++
-            } catch {
-                $logEntry = "ERROR (File): Failed to rename '$($file.FullName)'. Details: $($_.Exception.Message)"
-                Write-Host $logEntry -ForegroundColor Red
-                $logEntry | Out-File -FilePath $unrecoverableLog -Encoding utf8 -Append
-            }
-        }
+    if (Invoke-SanitizeRename -Item $file -TypeLabel "File") {
+        $sanitizedCount++
     }
 }
 Write-Host "Phase 1 Complete. Sanitized $sanitizedCount file and directory names."
