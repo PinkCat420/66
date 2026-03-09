@@ -21,7 +21,7 @@ $startTime = Get-Date
 $logPath = $PSScriptRoot # Log files will be saved in the same directory as the script.
 $repairedLog = Join-Path $logPath "Repaired_Files.log"
 $unrecoverableLog = Join-Path $logPath "Unrecoverable_Files.log"
-$archiveExtensions = @('.zip', '.rar', '.7z')
+$archiveExtensions = [System.Collections.Generic.HashSet[string]]::new(@('.zip', '.rar', '.7z'), [System.StringComparer]::OrdinalIgnoreCase)
 $imageExtensions = @('.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.tif', '.tiff')
 
 # --- PowerShell Version Check ---
@@ -139,7 +139,7 @@ $renamePlan = foreach ($file in $fileData) {
     $currentExtWithDot = [System.IO.Path]::GetExtension($currentPath).ToLower()
 
     # Exclude archives from extension repair.
-    if ($archiveExtensions -contains $currentExtWithDot) { continue }
+    if ($archiveExtensions.Contains($currentExtWithDot)) { continue }
 
     $currentExt = $currentExtWithDot.TrimStart('.')
     $trueExt = $file.FileTypeExtension.ToLower()
@@ -264,7 +264,7 @@ Write-Host "Phase 3 Complete. Repaired structure of $repairedPngCount PNG files.
 
 # --- PHASE 4: Archive Integrity Testing & Deletion ---
 Write-Host "`n--- PHASE 4: Testing Archive Integrity & Deleting Passworded Files ---" -ForegroundColor Cyan
-$allArchives = Get-ChildItem -Path $PSScriptRoot -Recurse -File | Where-Object { $archiveExtensions -contains $_.Extension.ToLower() }
+$allArchives = Get-ChildItem -Path $PSScriptRoot -Recurse -File | Where-Object { $archiveExtensions.Contains($_.Extension.ToLower()) }
 $totalArchives = ($allArchives | Measure-Object).Count
 $processedArchives = 0
 $corruptArchives = 0
